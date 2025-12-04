@@ -2,7 +2,7 @@
 
 ## 🔑 Funcionalidades Básicas
 - [ ] Implementar **login de usuário**
-- [ ] Implementar **listagem de usuários cadastrados/conectados**
+- [ok] Implementar **listagem de usuários cadastrados/conectados**
 - [ ] Permitir **abertura de canal seguro de comunicação**
 - [ ] Implementar **verificação de integridade das mensagens**
 - [ ] Implementar **verificação de autenticidade das partes**
