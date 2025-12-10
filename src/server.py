@@ -2,75 +2,42 @@ import socket
 import threading
 import ssl
 import json
-from security import DHManager
+from security import DHManager 
+from authenticator import validate_login, register_user, user_exists 
 from cryptography.hazmat.primitives import serialization
-from authenticator import validate_login # <--- Importamos a autenticação
 
 host = "0.0.0.0"
 port = 8000
-
 clients = []
 users = []
 client_security = {} 
 
-# --- Configuração SSL (Igual ao anterior) ---
+# Configurações de Segurança
 context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
 context.load_cert_chain(certfile="certs/server.crt", keyfile="certs/server.key")
 context.load_verify_locations(cafile="certs/ca.crt")
 context.verify_mode = ssl.CERT_REQUIRED
 
-# --- GERA PARÂMETROS DH GLOBAIS ---
 global_dh = DHManager()
 server_params = global_dh.generate_parameters()
-
 params_bytes = server_params.parameter_bytes(
-    encoding=serialization.Encoding.PEM,
-    format=serialization.ParameterFormat.PKCS3
+    encoding=serialization.Encoding.PEM, format=serialization.ParameterFormat.PKCS3
 )
 
 def broadcast(message_str, sender_conn=None):
-    """Envia mensagem para todos. Se sender_conn for passado, não envia para ele."""
     for client in clients:
         if client != sender_conn:
             try:
                 dh_mgr = client_security[client]
-                signed_json = dh_mgr.sign_message(message_str)
-                client.send(signed_json.encode('utf-8'))
-            except:
-                pass
-
-def send_private(client, message_str):
-    """Envia mensagem apenas para um cliente específico"""
-    try:
-        dh_mgr = client_security[client]
-        signed_json = dh_mgr.sign_message(message_str)
-        client.send(signed_json.encode('utf-8'))
-    except:
-        pass
-
-def remove_client(client):
-    if client in clients:
-        try:
-            index = clients.index(client)
-            user = users[index]
-            clients.remove(client)
-            users.remove(user)
-            del client_security[client]
-            client.close()
-            print(f"[LOG] {user} desconectou.")
-            broadcast(f"--- {user} saiu do chat ---", None)
-        except:
-            pass
+                client.send(dh_mgr.sign_message(message_str).encode('utf-8'))
+            except: pass
 
 def handle(client):
     dh_mgr = client_security[client]
-    
     while True:
         try:
             data = client.recv(4096).decode('utf-8')
-            if not data:
-                remove_client(client)
-                break
+            if not data: break
             
             message, is_valid = dh_mgr.verify_message(data)
             index = clients.index(client)
@@ -80,95 +47,86 @@ def handle(client):
                 print(f"[ALERTA] Integridade falhou para {user}")
                 continue
 
-            # --- COMANDO DE LISTAGEM ---
-            if message.strip() == '/usuarios':
+            if message == '/usuarios':
                 lista = ", ".join(users)
-                send_private(client, f"[SISTEMA] Usuários Online: {lista}")
-            
-            # --- MENSAGEM NORMAL ---
+                client.send(dh_mgr.sign_message(f"[SISTEMA] Online: {lista}").encode('utf-8'))
             else:
                 print(f"[{user}]: {message}")
-                msg_final = f"{user}: {message}"
-                broadcast(msg_final, client) # Manda para os outros
-
-        except:
-            remove_client(client)
-            break
+                broadcast(f"{user}: {message}", client)
+        except: break
+    
+    # Remove cliente ao sair do loop
+    if client in clients:
+        idx = clients.index(client)
+        u = users[idx]
+        clients.remove(client)
+        users.remove(u)
+        del client_security[client]
+        print(f"[LOG] {u} saiu.")
+        broadcast(f"{u} saiu do chat.", None)
+        client.close()
 
 def receive():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind((host, port))
     server.listen()
-    print(f"[*] Servidor Seguro (mTLS + HMAC + Auth) rodando...")
+    # SE ESSA MENSAGEM NAO APARECER, VOCE ESTA RODANDO O ARQUIVO ERRADO
+    print(f"[*] Servidor Seguro (mTLS + HMAC + Registro) rodando...")
 
     while True:
         try:
-            client_socket, address = server.accept()
-            conn = context.wrap_socket(client_socket, server_side=True)
-            print(f"Conexão mTLS: {address}")
-
-            # 1. Troca de Chaves DH
-            dh_mgr = DHManager()
-            my_pub_key = dh_mgr.generate_private_key(server_params)
+            client, addr = server.accept()
+            conn = context.wrap_socket(client, server_side=True)
             
-            conn.send(len(params_bytes).to_bytes(4, 'big'))
-            conn.send(params_bytes)
-            conn.send(len(my_pub_key).to_bytes(4, 'big'))
-            conn.send(my_pub_key)
-
-            pub_len = int.from_bytes(conn.recv(4), 'big')
-            client_pub_key = conn.recv(pub_len)
-            dh_mgr.compute_shared_secret(client_pub_key)
-            client_security[conn] = dh_mgr 
+            # 1. Troca de Chaves
+            dh = DHManager()
+            pub = dh.generate_private_key(server_params)
+            conn.send(len(params_bytes).to_bytes(4, 'big')); conn.send(params_bytes)
+            conn.send(len(pub).to_bytes(4, 'big')); conn.send(pub)
             
-            # 2. LOGIN (Esperando JSON com user e pass)
-            # Solicitamos credenciais
-            req = dh_mgr.sign_message("LOGIN_REQ")
-            conn.send(req.encode('utf-8'))
+            l = int.from_bytes(conn.recv(4), 'big')
+            client_pub = conn.recv(l)
+            dh.compute_shared_secret(client_pub)
+            client_security[conn] = dh
             
-            # Recebe credenciais
-            resp_json = conn.recv(4096).decode('utf-8')
-            login_data_str, valid = dh_mgr.verify_message(resp_json)
-            
-            if valid:
-                # O payload vem como string "user:senha", separamos aqui
-                try:
-                    login_data = json.loads(login_data_str)
-                    u_try = login_data['u']
-                    p_try = login_data['p']
+            # 2. Loop de Autenticação
+            autenticado = False
+            while not autenticado:
+                conn.send(dh.sign_message("AUTH_REQ").encode('utf-8'))
+                resp = conn.recv(4096).decode('utf-8')
+                payload_str, valid = dh.verify_message(resp)
+                
+                if valid:
+                    data = json.loads(payload_str)
+                    action = data.get('action')
                     
-                    if validate_login(u_try, p_try):
-                        if u_try in users:
-                            # Evita usuário duplicado
-                            error = dh_mgr.sign_message("ERRO: Usuário já conectado.")
-                            conn.send(error.encode('utf-8'))
-                            conn.close()
-                            continue
-
-                        users.append(u_try)
-                        clients.append(conn)
-                        print(f"Login SUCESSO: {u_try}")
-                        
-                        # Avisa sucesso
-                        ok_msg = dh_mgr.sign_message("LOGIN_OK")
-                        conn.send(ok_msg.encode('utf-8'))
-
-                        # Thread de chat
-                        thread = threading.Thread(target=handle, args=(conn,))
-                        thread.start()
-                        
-                        broadcast(f"--- {u_try} entrou no chat ---", conn)
-                    else:
-                        print(f"Falha login: {u_try}")
-                        conn.close()
-                except:
-                    conn.close()
-            else:
-                print("Integridade falhou no login.")
-                conn.close()
-
+                    if action == 'login':
+                        u = data['u']
+                        if validate_login(u, data['p']):
+                            if u in users:
+                                conn.send(dh.sign_message("ERRO: Usuário já conectado.").encode('utf-8'))
+                            else:
+                                users.append(u); clients.append(conn)
+                                print(f"Login OK: {u}")
+                                conn.send(dh.sign_message("AUTH_OK").encode('utf-8'))
+                                autenticado = True
+                                threading.Thread(target=handle, args=(conn,)).start()
+                                broadcast(f"{u} entrou!", conn)
+                        else:
+                            conn.send(dh.sign_message("ERRO: Dados inválidos.").encode('utf-8'))
+                            
+                    elif action == 'register':
+                        u = data['u']
+                        if user_exists(u):
+                            conn.send(dh.sign_message("ERRO: Usuário já existe.").encode('utf-8'))
+                        else:
+                            register_user(u, data['p'], data['email'], data['phone'])
+                            print(f"Registrado: {u}")
+                            conn.send(dh.sign_message("REG_OK").encode('utf-8'))
+                else:
+                    conn.close(); break
         except Exception as e:
-            print(f"Erro no accept: {e}")
+            print(f"Erro: {e}")
 
 if __name__ == "__main__":
     receive()

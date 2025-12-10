@@ -18,61 +18,31 @@ class DHManager:
         return self.parameters
 
     def generate_private_key(self, parameters=None):
-        if parameters:
-            self.parameters = parameters
-        
+        if parameters: self.parameters = parameters
         self.private_key = self.parameters.generate_private_key()
-        public_key = self.private_key.public_key()
-        
-        # Serializa a chave pública para enviar pela rede (formato PEM)
-        return public_key.public_bytes(
+        return self.private_key.public_key().public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         )
 
     def compute_shared_secret(self, peer_public_key_bytes):
         peer_public_key = serialization.load_pem_public_key(peer_public_key_bytes)
-        
         shared_secret = self.private_key.exchange(peer_public_key)
-        
-        # Deriva uma chave simétrica limpa a partir do segredo matemático
         self.shared_key = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=None,
-            info=b'handshake data',
+            algorithm=hashes.SHA256(), length=32, salt=None, info=b'handshake data'
         ).derive(shared_secret)
-        
-        print(f"[DH] Segredo Compartilhado estabelecido!")
         return self.shared_key
 
     def sign_message(self, message):
-        if not self.shared_key:
-            raise Exception("Chave não estabelecida!")
-            
-        # Calcula HMAC-SHA256
+        if not self.shared_key: raise Exception("Chave não estabelecida!")
         h = hmac.new(self.shared_key, message.encode('utf-8'), hashlib.sha256)
-        signature = h.hexdigest()
-        
-        return json.dumps({
-            "msg": message,
-            "hmac": signature
-        })
+        return json.dumps({"msg": message, "hmac": h.hexdigest()})
 
     def verify_message(self, json_data):
-        """Valida se a mensagem foi adulterada"""
         try:
             data = json.loads(json_data)
-            message = data['msg']
-            received_hmac = data['hmac']
-            
-            # Recalcula HMAC
-            h = hmac.new(self.shared_key, message.encode('utf-8'), hashlib.sha256)
-            calculated_hmac = h.hexdigest()
-            
-            if hmac.compare_digest(calculated_hmac, received_hmac):
-                return message, True # Íntegro
-            else:
-                return message, False # VIOLADO
-        except:
-            return None, False
+            h = hmac.new(self.shared_key, data['msg'].encode('utf-8'), hashlib.sha256)
+            if hmac.compare_digest(h.hexdigest(), data['hmac']):
+                return data['msg'], True
+            return data['msg'], False
+        except: return None, False
